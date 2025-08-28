@@ -44,3 +44,26 @@ async def edges(file: UploadFile = File(...)):
     img = open_image_or_400(file).convert("L")
     edged = img.filter(ImageFilter.FIND_EDGES)
     return to_stream(edged, "PNG")
+
+# === Auth endpoints ===
+from fastapi import Body, Depends
+from app.auth import create_token, verify_token
+
+@app.post("/auth/login")
+def login(payload: dict = Body(...)):
+    username = payload.get("username")
+    password = payload.get("password")
+    from app.auth import USERS
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+    user = USERS.get(username)
+    if not user or user["password"] != password:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    return {"access_token": create_token(username), "token_type": "bearer"}
+
+@app.get("/whoami")
+def whoami(user: dict = Depends(verify_token)):
+    return {"user": user["username"], "role": user["role"]}
+
+from app.auth import router as auth_router
+app.include_router(auth_router)

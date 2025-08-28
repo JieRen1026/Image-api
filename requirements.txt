@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 python-multipart
 pillow
+PyJWT==2.9.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
