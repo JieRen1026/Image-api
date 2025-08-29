@@ -7,6 +7,7 @@ from app.auth import verify_token, router as auth_router, get_current_user, requ
 from sqlalchemy.orm import Session
 from app.db import init_db, SessionLocal
 from app.models import ImageJob, JobStatus
+import numpy as np, cv2
 
 app = FastAPI(title="Image Processing API")
 
@@ -46,7 +47,7 @@ def open_image_or_400(file: UploadFile) -> Image.Image:
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-# === Existing image endpoints (kept as-is) ===
+# == Image endpoints ==
 @app.post("/images/grayscale")
 async def grayscale(file: UploadFile = File(...), current=Depends(verify_token)):
     img = open_image_or_400(file).convert("RGB")
@@ -65,12 +66,32 @@ async def resize(
     return to_stream(resized, "PNG")
 
 @app.post("/images/edges")
-async def edges(current=Depends(verify_token), file: UploadFile = File(...)):
-    img = open_image_or_400(file).convert("L")
-    edged = img.filter(ImageFilter.FIND_EDGES)
-    return to_stream(edged, "PNG")
+async def edges(
+    current=Depends(verify_token),
+    file: UploadFile = File(...),
+    ksize: int = Query(5, ge=3, le=15),
+    sigma: float = Query(1.4, ge=0.3, le=5.0),
+    low: int = Query(50, ge=0, le=255),
+    high: int = Query(150, ge=0, le=255),
+    passes: int = Query(6, ge=1, le=20),
+):
+    data = await file.read()
+    img_np = np.frombuffer(data, np.uint8)
+    src = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+    if src is None:
+        raise HTTPException(400, "Invalid image file")
 
-# === Job-based endpoints (evidence of two data types) ===
+    gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+    edges = None
+    for _ in range(passes):
+        blurred = cv2.GaussianBlur(gray, (ksize | 1, ksize | 1), sigma)
+        edges = cv2.Canny(blurred, low, high, L2gradient=True)
+        gray = edges
+
+    pil_img = Image.fromarray(edges)
+    return to_stream(pil_img, "PNG")
+
+# === Job-based endpoints ===
 @app.post("/images/jobs")
 async def create_job(
     file: UploadFile = File(...),
