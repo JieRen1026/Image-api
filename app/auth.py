@@ -1,63 +1,81 @@
-import os, time, jwt
-from fastapi import HTTPException, status, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Annotated
 
-# Simple hard-coded users (OK per rubric for A1)
-USERS = {
-    "alice": {"password": "password1", "role": "admin"},
-    "bob":   {"password": "password2", "role": "user"},
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from pydantic import BaseModel
+import os
+
+# simple in-memory user store for demo/marking
+# username -> { "username": str, "password_hash": str, "role": "user"|"admin" }
+_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_users = {
+    "alice": {"username": "alice", "password_hash": _pwd.hash("password1"), "role": "user"},
+    "admin": {"username": "admin", "password_hash": _pwd.hash("admin123"), "role": "admin"},
 }
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")   # set real env secret later
-JWT_ALGO = "HS256"
-TOKEN_TTL = 60 * 60  # 1 hour
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-security = HTTPBearer()
-
-def create_token(username: str) -> str:
-    now = int(time.time())
-    payload = {
-        "sub": username,
-        "iat": now,
-        "exp": now + TOKEN_TTL,
-        "role": USERS[username]["role"],
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-
-def verify_token(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    token = creds.credentials
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
-        username = payload.get("sub")
-        if not username or username not in USERS:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token subject")
-        return {"username": username, "role": payload.get("role")}
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-from fastapi import APIRouter
-from pydantic import BaseModel
-
-router = APIRouter()
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+router = APIRouter(prefix="/auth", tags=["auth"])
 
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
-@router.post("/auth/login", response_model=Token)
-def login(req: LoginRequest):
-    user = USERS.get(req.username)
-    if not user or user["password"] != req.password:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
-    token = create_token(req.username)
-    return {"access_token": token, "token_type": "bearer"}
+class User(BaseModel):
+    username: str
+    role: str
 
-@router.get("/whoami")
-def whoami(current=Depends(verify_token)):
-    # `current` is {"username": "...", "role": "..."} from verify_token
-    return {"user": current["username"], "role": current["role"]}
+def _authenticate(username: str, password: str) -> Optional[User]:
+    u = _users.get(username)
+    if not u or not _pwd.verify(password, u["password_hash"]):
+        return None
+    return User(username=u["username"], role=u["role"])
+
+def _create_token(user: User, minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES) -> str:
+    now = datetime.now(tz=timezone.utc)
+    payload = {
+        "sub": user.username,
+        "role": user.role,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=minutes)).timestamp()),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+@router.post("/login", response_model=Token)
+def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user = _authenticate(form.username, form.password)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
+    token = _create_token(user)
+    return Token(access_token=token)
+
+def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> User:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        role = payload.get("role")
+        if not username or not role:
+            raise JWTError("missing claims")
+        u = _users.get(username)
+        if not u:
+            raise JWTError("user not found")
+        return User(username=username, role=role)
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+
+def require_role(required: str):
+    def checker(user: Annotated[User, Depends(get_current_user)]) -> User:
+        if user.role != required:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+        return user
+    return checker
+
+def verify_token(user: Annotated[User, Depends(get_current_user)]) -> User:
+    return user
+PY'
