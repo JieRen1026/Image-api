@@ -1,0 +1,172 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Image API – Barebones Client</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 12px; }
+    fieldset { margin: 16px 0; }
+    input, select, button { padding: 6px 8px; margin: 4px 0; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    pre { background: #111; color: #0f0; padding: 8px; overflow: auto; }
+    img { max-width: 100%; height: auto; border: 1px solid #ddd; }
+    .muted { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+<h1>Image Processing API – Demo Client</h1>
+
+<p class="muted">
+This page calls your API on the same origin. Visit it at <code>/client/</code> on your server.
+</p>
+
+<section>
+  <fieldset>
+    <legend>1) Login</legend>
+    <div class="row">
+      <label>Username <input id="user" value="alice"></label>
+      <label>Password <input id="pass" type="password" value="password1"></label>
+      <button id="btnLogin">Login</button>
+      <button id="btnLogout">Logout</button>
+    </div>
+    <div>Token: <span id="tok" class="muted">(none)</span></div>
+    <div id="me" class="muted"></div>
+  </fieldset>
+</section>
+
+<section>
+  <fieldset>
+    <legend>2) Upload & Process</legend>
+    <div class="row">
+      <label>Operation
+        <select id="op">
+          <option value="grayscale">grayscale</option>
+          <option value="edge">edge</option>
+        </select>
+      </label>
+      <input type="file" id="file" accept="image/*">
+      <button id="btnUpload">Create Job</button>
+    </div>
+    <div id="jobOut" class="muted"></div>
+    <div><img id="imgOut" alt="Processed image will appear here"></div>
+  </fieldset>
+</section>
+
+<section>
+  <fieldset>
+    <legend>3) External (Picsum) – show image</legend>
+    <div class="row">
+      <select id="extOp">
+        <option value="">raw</option>
+        <option value="grayscale">grayscale</option>
+        <option value="edge">edge</option>
+      </select>
+      <button id="btnExternal">Fetch</button>
+    </div>
+    <div><img id="externalImg" alt="External result will appear here"></div>
+  </fieldset>
+</section>
+
+<section>
+  <fieldset>
+    <legend>4) Admin Logs (optional)</legend>
+    <div class="row">
+      <input id="logLimit" type="number" value="10" min="1" max="200">
+      <button id="btnLogs">Fetch logs</button>
+    </div>
+    <pre id="logs"></pre>
+  </fieldset>
+</section>
+
+<script>
+let token = localStorage.getItem('token'); // persist between refreshes
+
+function setTok(t) {
+  token = t;
+  document.getElementById('tok').textContent = t ? t.slice(0,30)+'...' : '(none)';
+  if (t) localStorage.setItem('token', t);
+  else   localStorage.removeItem('token');
+}
+
+async function call(path, opts = {}) {
+  opts.headers = opts.headers || {};
+  if (token) opts.headers['Authorization'] = 'Bearer ' + token;
+  const res = await fetch(path, opts);
+  if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+  return res;
+}
+
+async function refreshMe() {
+  const meEl = document.getElementById('me');
+  if (!token) { meEl.textContent = 'Not logged in'; return; }
+  try {
+    const me = await call('/me');
+    meEl.textContent = await me.text();
+  } catch {
+    meEl.textContent = 'Not logged in';
+  }
+}
+
+// Initialize UI from stored token on load
+window.addEventListener('DOMContentLoaded', () => {
+  setTok(token);
+  refreshMe();
+});
+
+document.getElementById('btnLogin').onclick = async () => {
+  const u = document.getElementById('user').value;
+  const p = document.getElementById('pass').value;
+  const body = new URLSearchParams({ username: u, password: p });
+  const res = await fetch('/auth/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body
+  });
+  const json = await res.json();
+  setTok(json.access_token || null);
+  refreshMe();
+};
+
+document.getElementById('btnLogout').onclick = () => {
+  setTok(null);
+  document.getElementById('me').textContent = 'Not logged in';
+};
+
+document.getElementById('btnUpload').onclick = async () => {
+  const f = document.getElementById('file').files[0];
+  if (!f) { alert('Choose an image file'); return; }
+  const op = document.getElementById('op').value;
+  const fd = new FormData();
+  fd.append('file', f);
+  const res = await call('/images/jobs?op=' + encodeURIComponent(op), { method: 'POST', body: fd });
+  const json = await res.json();
+  document.getElementById('jobOut').textContent = JSON.stringify(json);
+  if (json.job_id) {
+    const imgRes = await call('/images/' + json.job_id + '/file?kind=processed');
+    const blob = await imgRes.blob();
+    document.getElementById('imgOut').src = URL.createObjectURL(blob);
+  }
+};
+
+document.getElementById('btnExternal').onclick = async () => {
+  const op = document.getElementById('extOp').value;
+  const url = '/v1/external/random' + (op ? ('?op=' + encodeURIComponent(op)) : '');
+  const res = await call(url);
+  const blob = await res.blob();
+  document.getElementById('externalImg').src = URL.createObjectURL(blob);
+};
+
+document.getElementById('btnLogs').onclick = async () => {
+  const lim = document.getElementById('logLimit').value || 10;
+  try {
+    const res = await call('/admin/logs?limit=' + lim);
+    const json = await res.json();
+    document.getElementById('logs').textContent = JSON.stringify(json, null, 2);
+  } catch (e) {
+    document.getElementById('logs').textContent = 'Error: ' + e.message + '\n(Do you have an admin token?)';
+  }
+};
+</script>
+</body>
+</html>

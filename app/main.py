@@ -2,22 +2,31 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends
 from fastapi.responses import StreamingResponse, FileResponse
 from PIL import Image, ImageFilter, UnidentifiedImageError
 from io import BytesIO
+from typing import Optional
 import os, shutil, time, hashlib, secrets
-from app.auth import verify_token, router as auth_router, get_current_user, require_role, User
-from sqlalchemy.orm import Session
-from app.db import init_db, engine, SessionLocal
-from app.models import ImageJob, JobStatus
+
 import numpy as np, cv2
+from sqlalchemy import inspect, text
+from sqlalchemy.orm import Session
+
+from app.auth import verify_token, router as auth_router, get_current_user, require_role, User
+from app.db import init_db, engine, SessionLocal
+from app.models import ImageJob, JobStatus, ProcessingLog
 from app.routers.images import router as images_router
 from app.routers.external import router as external_router
-from sqlalchemy import inspect, text
+from fastapi.staticfiles import StaticFiles
+
 
 app = FastAPI(title="Image Processing API")
 
+# Routers
 app.include_router(auth_router)
 app.include_router(images_router, prefix="/v1")
 app.include_router(external_router, prefix="/v1")
+app.mount("/client", StaticFiles(directory="client", html=True), name="client")
 
+
+# --- Startup / Admin DB ---
 @app.on_event("startup")
 def on_startup():
     init_db()
@@ -47,6 +56,7 @@ def admin_dbcheck():
         return {"error": "dbcheck failed", "inspector_error": err1 if 'err1' in locals() else None, "sqlite_error": str(e2)}
 
 
+# --- Paths / DB session ---
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 UPLOADS = os.path.join(DATA_DIR, "uploads")
 PROCESSED = os.path.join(DATA_DIR, "processed")
@@ -60,7 +70,22 @@ def get_db():
     finally:
         db.close()
 
-# --- Helpers ---
+
+# --- Log helper ---
+def log_action(db: Session, user_id: str, job_id: str, action: str, details: dict = None):
+    log = ProcessingLog(
+        user_id=user_id,
+        job_id=job_id,
+        action=action,
+        details=details or {}
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+
+# --- Health / Helpers ---
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -69,8 +94,12 @@ def to_stream(img: Image.Image, fmt: str = "PNG") -> StreamingResponse:
     buf = BytesIO()
     img.save(buf, format=fmt)
     buf.seek(0)
-    return StreamingResponse(buf, media_type="image/png",
-                             headers={"Content-Disposition": 'inline; filename="output.png"'})
+    # Keep PNG response for simplicity (matches your prior implementation)
+    return StreamingResponse(
+        buf,
+        media_type="image/png",
+        headers={"Content-Disposition": 'inline; filename="output.png"'}
+    )
 
 def open_image_or_400(file: UploadFile) -> Image.Image:
     try:
@@ -80,7 +109,8 @@ def open_image_or_400(file: UploadFile) -> Image.Image:
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-# == Image endpoints ==
+
+# == Simple image endpoints ==
 @app.post("/images/grayscale")
 async def grayscale(file: UploadFile = File(...), current=Depends(verify_token)):
     img = open_image_or_400(file).convert("RGB")
@@ -124,7 +154,8 @@ async def edges(
     pil_img = Image.fromarray(edges)
     return to_stream(pil_img, "PNG")
 
-# === Job-based endpoints ===
+
+# === Job-based endpoint (with logging) ===
 @app.post("/images/jobs")
 async def create_job(
     file: UploadFile = File(...),
@@ -135,7 +166,7 @@ async def create_job(
     if not file.content_type.startswith("image/"):
         raise HTTPException(415, "Only image/* uploads are supported")
 
-    # save original (binary file)
+    # save original
     original_path = os.path.join(UPLOADS, file.filename)
     with open(original_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -166,46 +197,59 @@ async def create_job(
         job.width, job.height = w, h
         job.status = JobStatus.done
         db.commit()
+
+        # success log
+        log_action(
+            db=db,
+            user_id=user.username,
+            job_id=job.id,
+            action=op,  # "grayscale" or "edge"
+            details={"width": job.width, "height": job.height}
+        )
+
     except Exception as e:
         job.status = JobStatus.error
         job.error_message = str(e)
         db.commit()
+
+        # error log
+        log_action(
+            db=db,
+            user_id=user.username,
+            job_id=job.id,
+            action="error",
+            details={"error": str(e)}
+        )
+
         raise HTTPException(500, f"Processing failed: {e}")
 
     return {"job_id": job.id, "status": job.status, "mime_type": job.mime_type}
 
-@app.get("/images/{job_id}/meta")
-def get_meta(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    job = db.get(ImageJob, job_id)
-    if not job or job.user_id != user.username:
-        raise HTTPException(404, "Not found")
-    return {
-        "job_id": job.id,
-        "status": job.status,
-        "mime_type": job.mime_type,
-        "params": job.params,
-        "width": job.width,
-        "height": job.height,
-        "created_at": job.created_at.isoformat(),
-        "original_path": job.original_path if job.status == JobStatus.done else None,
-        "processed_path": job.processed_path if job.status == JobStatus.done else None,
-        "error_message": job.error_message,
-    }
 
-@app.get("/images/{job_id}/file")
-def get_file(
-    job_id: str,
-    kind: str = Query("processed", pattern="^(processed|original)$"),
-    user: User = Depends(get_current_user),
+# === Read-only admin logs endpoint ===
+@app.get("/admin/logs")
+def admin_logs(
+    limit: int = Query(20, ge=1, le=200),
+    action: Optional[str] = Query(None),
+    user: User = Depends(require_role("admin")),
     db: Session = Depends(get_db),
 ):
-    job = db.get(ImageJob, job_id)
-    if not job or job.user_id != user.username:
-        raise HTTPException(404, "Not found")
-    path = job.processed_path if kind == "processed" else job.original_path
-    if not path or not os.path.exists(path):
-        raise HTTPException(404, "file missing")
-    return FileResponse(path, media_type=job.mime_type)
+    q = db.query(ProcessingLog).order_by(ProcessingLog.timestamp.desc())
+    if action:
+        q = q.filter(ProcessingLog.action == action)
+    rows = q.limit(limit).all()
+    return [
+        {
+            "id": r.id,
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+            "user_id": r.user_id,
+            "job_id": r.job_id,
+            "action": r.action,
+            "details": r.details,
+        }
+        for r in rows
+    ]
+
 
 # === CPU intensive endpoint (kept) ===
 @app.get("/cpu-burn")
@@ -220,6 +264,7 @@ def cpu_burn(ms: int = 250, iters: int = 60000):
         n += 1
     return {"ok": True, "cycles": n, "pid": os.getpid()}
 
+
 # === User/role endpoints (kept) ===
 @app.get("/me")
 def me(user: User = Depends(get_current_user)):
@@ -228,3 +273,47 @@ def me(user: User = Depends(get_current_user)):
 @app.get("/admin/ping")
 def admin_ping(user: User = Depends(require_role("admin"))):
     return {"ok": True, "msg": "admin only"}
+
+# --- Jobs: meta & file download (added) ---
+from fastapi import HTTPException, Query, Depends
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+
+@app.get("/images/{job_id}/meta")
+def get_meta(
+    job_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.get(ImageJob, job_id)
+    if not job or job.user_id != user.username:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "mime_type": job.mime_type,
+        "params": job.params,
+        "width": job.width,
+        "height": job.height,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "original_path": job.original_path if job.status == JobStatus.done else None,
+        "processed_path": job.processed_path if job.status == JobStatus.done else None,
+        "error_message": job.error_message,
+    }
+
+@app.get("/images/{job_id}/file")
+def get_file(
+    job_id: str,
+    kind: str = Query("processed", pattern="^(processed|original)$"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.get(ImageJob, job_id)
+    if not job or job.user_id != user.username:
+        raise HTTPException(status_code=404, detail="Not Found")
+    path = job.processed_path if kind == "processed" else job.original_path
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="file missing")
+    # Use the saved mime_type for original; processed is PNG
+    media_type = job.mime_type if kind == "original" else "image/png"
+    return FileResponse(path, media_type=media_type)
