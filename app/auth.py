@@ -78,4 +78,4 @@ def require_role(required: str):
 
 def verify_token(user: Annotated[User, Depends(get_current_user)]) -> User:
     return user
-PY'
+

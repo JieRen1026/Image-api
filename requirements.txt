@@ -8,3 +8,4 @@ passlib[bcrypt]==1.7.4
 SQLAlchemy
 opencv-python
 numpy
+httpx==0.27.2

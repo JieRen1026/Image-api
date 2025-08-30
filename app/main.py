@@ -8,11 +8,18 @@ from sqlalchemy.orm import Session
 from app.db import init_db, SessionLocal
 from app.models import ImageJob, JobStatus
 import numpy as np, cv2
+from app.routers.images import router as images_router
+from app.routers.external import router as external_router
 
 app = FastAPI(title="Image Processing API")
 
 app.include_router(auth_router)
-init_db()
+app.include_router(images_router, prefix="/v1")
+app.include_router(external_router, prefix="/v1")
+
+@app.on_event("startup")
+      def _startup():
+      init_db()
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 UPLOADS = os.path.join(DATA_DIR, "uploads")
