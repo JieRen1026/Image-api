@@ -1,30 +1,35 @@
+# app/main.py
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends
 from fastapi.responses import StreamingResponse, FileResponse
-from PIL import Image, ImageFilter, UnidentifiedImageError
-from io import BytesIO
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from typing import Optional
+from io import BytesIO
+from PIL import Image, ImageFilter, UnidentifiedImageError
 import os, shutil, time, hashlib, secrets
 
 import numpy as np, cv2
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+# --- App first ---
+app = FastAPI(title="Image Processing API")
+
+# --- Routers (import after app is created) ---
 from app.auth import verify_token, router as auth_router, get_current_user, require_role, User
 from app.db import init_db, engine, SessionLocal
 from app.models import ImageJob, JobStatus, ProcessingLog
 from app.routers.images import router as images_router
 from app.routers.external import router as external_router
-from fastapi.staticfiles import StaticFiles
 
-
-app = FastAPI(title="Image Processing API")
-
-# Routers
 app.include_router(auth_router)
 app.include_router(images_router, prefix="/v1")
 app.include_router(external_router, prefix="/v1")
-app.mount("/client", StaticFiles(directory="client", html=True), name="client")
 
+# Optional client mount
+_client_dir = Path("client")
+if _client_dir.exists():
+    app.mount("/client", StaticFiles(directory=str(_client_dir), html=True), name="client")
 
 # --- Startup / Admin DB ---
 @app.on_event("startup")
@@ -38,7 +43,6 @@ def admin_initdb():
 
 @app.get("/admin/dbcheck")
 def admin_dbcheck():
-    # Try SQLAlchemy inspector first
     try:
         insp = inspect(engine)
         tables = insp.get_table_names()
@@ -47,14 +51,12 @@ def admin_dbcheck():
     except Exception as e:
         err1 = str(e)
 
-    # Fallback: direct SQLite query
     try:
         with SessionLocal() as db:
             rows = db.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
             return {"tables": [r[0] for r in rows], "via": "sqlite_master"}
     except Exception as e2:
         return {"error": "dbcheck failed", "inspector_error": err1 if 'err1' in locals() else None, "sqlite_error": str(e2)}
-
 
 # --- Paths / DB session ---
 DATA_DIR = os.getenv("DATA_DIR", "/data")
@@ -70,7 +72,6 @@ def get_db():
     finally:
         db.close()
 
-
 # --- Log helper ---
 def log_action(db: Session, user_id: str, job_id: str, action: str, details: dict = None):
     log = ProcessingLog(
@@ -84,7 +85,6 @@ def log_action(db: Session, user_id: str, job_id: str, action: str, details: dic
     db.refresh(log)
     return log
 
-
 # --- Health / Helpers ---
 @app.get("/health")
 def health():
@@ -94,7 +94,6 @@ def to_stream(img: Image.Image, fmt: str = "PNG") -> StreamingResponse:
     buf = BytesIO()
     img.save(buf, format=fmt)
     buf.seek(0)
-    # Keep PNG response for simplicity (matches your prior implementation)
     return StreamingResponse(
         buf,
         media_type="image/png",
@@ -108,7 +107,6 @@ def open_image_or_400(file: UploadFile) -> Image.Image:
         return img
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="Invalid image file")
-
 
 # == Simple image endpoints ==
 @app.post("/images/grayscale")
@@ -145,15 +143,14 @@ async def edges(
         raise HTTPException(400, "Invalid image file")
 
     gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
-    edges = None
+    edges_img = None
     for _ in range(passes):
         blurred = cv2.GaussianBlur(gray, (ksize | 1, ksize | 1), sigma)
-        edges = cv2.Canny(blurred, low, high, L2gradient=True)
-        gray = edges
+        edges_img = cv2.Canny(blurred, low, high, L2gradient=True)
+        gray = edges_img
 
-    pil_img = Image.fromarray(edges)
+    pil_img = Image.fromarray(edges_img)
     return to_stream(pil_img, "PNG")
-
 
 # === Job-based endpoint (with logging) ===
 @app.post("/images/jobs")
@@ -166,12 +163,10 @@ async def create_job(
     if not file.content_type.startswith("image/"):
         raise HTTPException(415, "Only image/* uploads are supported")
 
-    # save original
     original_path = os.path.join(UPLOADS, file.filename)
     with open(original_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # create metadata row
     job = ImageJob(
         user_id=user.username,
         original_path=original_path,
@@ -181,7 +176,6 @@ async def create_job(
     )
     db.add(job); db.commit(); db.refresh(job)
 
-    # process
     try:
         im = Image.open(original_path).convert("RGB")
         w, h = im.size
@@ -198,12 +192,11 @@ async def create_job(
         job.status = JobStatus.done
         db.commit()
 
-        # success log
         log_action(
             db=db,
             user_id=user.username,
             job_id=job.id,
-            action=op,  # "grayscale" or "edge"
+            action=op,
             details={"width": job.width, "height": job.height}
         )
 
@@ -212,7 +205,6 @@ async def create_job(
         job.error_message = str(e)
         db.commit()
 
-        # error log
         log_action(
             db=db,
             user_id=user.username,
@@ -224,7 +216,6 @@ async def create_job(
         raise HTTPException(500, f"Processing failed: {e}")
 
     return {"job_id": job.id, "status": job.status, "mime_type": job.mime_type}
-
 
 # === Read-only admin logs endpoint ===
 @app.get("/admin/logs")
@@ -250,8 +241,7 @@ def admin_logs(
         for r in rows
     ]
 
-
-# === CPU intensive endpoint (kept) ===
+# === CPU intensive endpoint ===
 @app.get("/cpu-burn")
 def cpu_burn(ms: int = 250, iters: int = 60000):
     end = time.time() + ms/1000.0
@@ -264,8 +254,7 @@ def cpu_burn(ms: int = 250, iters: int = 60000):
         n += 1
     return {"ok": True, "cycles": n, "pid": os.getpid()}
 
-
-# === User/role endpoints (kept) ===
+# === User/role endpoints ===
 @app.get("/me")
 def me(user: User = Depends(get_current_user)):
     return {"username": user.username, "role": user.role}
@@ -274,11 +263,7 @@ def me(user: User = Depends(get_current_user)):
 def admin_ping(user: User = Depends(require_role("admin"))):
     return {"ok": True, "msg": "admin only"}
 
-# --- Jobs: meta & file download (added) ---
-from fastapi import HTTPException, Query, Depends
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-
+# --- Jobs: meta & file download ---
 @app.get("/images/{job_id}/meta")
 def get_meta(
     job_id: str,
@@ -314,18 +299,14 @@ def get_file(
     path = job.processed_path if kind == "processed" else job.original_path
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="file missing")
-    # Use the saved mime_type for original; processed is PNG
     media_type = job.mime_type if kind == "original" else "image/png"
     return FileResponse(path, media_type=media_type)
 
 # --- My logs (auth required, non-admin) ---
-from fastapi import Query
-from sqlalchemy.orm import Session
-
 @app.get("/logs/mine")
 def my_logs(
     limit: int = Query(10, ge=1, le=200),
-    action: str | None = None,
+    action: Optional[str] = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
