@@ -5,11 +5,12 @@ from io import BytesIO
 import os, shutil, time, hashlib, secrets
 from app.auth import verify_token, router as auth_router, get_current_user, require_role, User
 from sqlalchemy.orm import Session
-from app.db import init_db, SessionLocal
+from app.db import init_db, engine, SessionLocal
 from app.models import ImageJob, JobStatus
 import numpy as np, cv2
 from app.routers.images import router as images_router
 from app.routers.external import router as external_router
+from sqlalchemy import inspect, text
 
 app = FastAPI(title="Image Processing API")
 
@@ -18,8 +19,33 @@ app.include_router(images_router, prefix="/v1")
 app.include_router(external_router, prefix="/v1")
 
 @app.on_event("startup")
-      def _startup():
-      init_db()
+def on_startup():
+    init_db()
+
+@app.post("/admin/initdb")
+def admin_initdb():
+    init_db()
+    return {"ok": True}
+
+@app.get("/admin/dbcheck")
+def admin_dbcheck():
+    # Try SQLAlchemy inspector first
+    try:
+        insp = inspect(engine)
+        tables = insp.get_table_names()
+        if tables:
+            return {"tables": tables, "via": "inspector"}
+    except Exception as e:
+        err1 = str(e)
+
+    # Fallback: direct SQLite query
+    try:
+        with SessionLocal() as db:
+            rows = db.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+            return {"tables": [r[0] for r in rows], "via": "sqlite_master"}
+    except Exception as e2:
+        return {"error": "dbcheck failed", "inspector_error": err1 if 'err1' in locals() else None, "sqlite_error": str(e2)}
+
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 UPLOADS = os.path.join(DATA_DIR, "uploads")
