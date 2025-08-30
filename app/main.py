@@ -317,3 +317,29 @@ def get_file(
     # Use the saved mime_type for original; processed is PNG
     media_type = job.mime_type if kind == "original" else "image/png"
     return FileResponse(path, media_type=media_type)
+
+# --- My logs (auth required, non-admin) ---
+from fastapi import Query
+from sqlalchemy.orm import Session
+
+@app.get("/logs/mine")
+def my_logs(
+    limit: int = Query(10, ge=1, le=200),
+    action: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ProcessingLog).filter(ProcessingLog.user_id == user.username).order_by(ProcessingLog.timestamp.desc())
+    if action:
+        q = q.filter(ProcessingLog.action == action)
+    rows = q.limit(limit).all()
+    return [
+        {
+            "id": r.id,
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+            "user_id": r.user_id,
+            "job_id": r.job_id,
+            "action": r.action,
+            "details": r.details,
+        } for r in rows
+    ]

@@ -160,7 +160,7 @@ document.getElementById('btnExternal').onclick = async () => {
 document.getElementById('btnLogs').onclick = async () => {
   const lim = document.getElementById('logLimit').value || 10;
   try {
-    const res = await call('/admin/logs?limit=' + lim);
+    const res = await call('/logs/mine?limit=' + lim);
     const json = await res.json();
     document.getElementById('logs').textContent = JSON.stringify(json, null, 2);
   } catch (e) {
